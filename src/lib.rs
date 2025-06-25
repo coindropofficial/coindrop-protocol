@@ -1,7 +1,7 @@
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 use anchor_lang::prelude::*;
 
-declare_id!("new_program_id_tbd"); // new program id not set yet
+declare_id!("Dropo5veYYfmUzbQPQYapa7yUKNsSiWoUXbMWnEApFuN");
 
 #[program]
 pub mod airdrop_protocol {
@@ -28,24 +28,6 @@ pub mod airdrop_protocol {
         require!(k_value > 0, AirdropError::InvalidKValue);
         require!(expiration_time > 0, AirdropError::InvalidExpirationTime);
 
-        // Initialize airdrop account
-        airdrop.airdrop_id = airdrop_id;
-        airdrop.creator = creator.key();
-        airdrop.mint = mint.key();
-        airdrop.webapp_authority = ctx.accounts.webapp_authority.key();
-        airdrop.total_supply = total_supply;
-        airdrop.remaining_supply = total_supply;
-        airdrop.claims_made = 0;
-        airdrop.is_closed = false;
-        airdrop.close_authority_revoked = revoke_close_authority;
-        airdrop.created_at = clock.unix_timestamp as u64;
-        airdrop.expiration_time = expiration_time;
-        airdrop.k_value = k_value;
-        airdrop.require_unique_wallets = require_unique_wallets;
-        airdrop.virtual_sol_reserves = 0;
-        airdrop.bump = ctx.bumps.airdrop;
-        airdrop.use_exponential_decay = use_exponential_decay;
-
         // Transfer tokens from creator to airdrop vault
         let transfer_ctx = CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
@@ -58,12 +40,34 @@ pub mod airdrop_protocol {
         );
         token_interface::transfer_checked(transfer_ctx, total_supply, ctx.accounts.mint.decimals)?;
 
+        // Get the actual vault balance after transfer (may be less than total_supply due to fees)
+        ctx.accounts.airdrop_vault.reload()?;
+        let actual_total_supply = ctx.accounts.airdrop_vault.amount;
+
+        // Initialize airdrop account with actual total supply
+        airdrop.airdrop_id = airdrop_id;
+        airdrop.creator = creator.key();
+        airdrop.mint = mint.key();
+        airdrop.webapp_authority = ctx.accounts.webapp_authority.key();
+        airdrop.total_supply = actual_total_supply;
+        airdrop.remaining_supply = actual_total_supply;
+        airdrop.claims_made = 0;
+        airdrop.is_closed = false;
+        airdrop.close_authority_revoked = revoke_close_authority;
+        airdrop.created_at = clock.unix_timestamp as u64;
+        airdrop.expiration_time = expiration_time;
+        airdrop.k_value = k_value;
+        airdrop.require_unique_wallets = require_unique_wallets;
+        airdrop.virtual_sol_reserves = 0;
+        airdrop.bump = ctx.bumps.airdrop;
+        airdrop.use_exponential_decay = use_exponential_decay;
+
         emit!(AirdropCreated {
             airdrop: airdrop.key(),
             creator: creator.key(),
             mint: mint.key(),
             airdrop_id,
-            total_supply,
+            total_supply: actual_total_supply,
             expiration_time,
             k_value,
             require_unique_wallets,
@@ -78,7 +82,6 @@ pub mod airdrop_protocol {
     pub fn distribute_airdrop(ctx: Context<DistributeAirdrop>) -> Result<()> {
         let airdrop = &mut ctx.accounts.airdrop;
         let recipient = &ctx.accounts.recipient;
-        let claim_record = &mut ctx.accounts.claim_record;
         let clock = Clock::get()?;
 
         // Check webapp authority
@@ -97,14 +100,11 @@ pub mod airdrop_protocol {
         // Ensure airdrop is still active
         require!(!airdrop.is_closed, AirdropError::AirdropClosed);
 
-        // Check unique wallet requirement
-        if airdrop.require_unique_wallets {
-            require!(!claim_record.has_claimed, AirdropError::AlreadyClaimed);
-        }
+        // Note: require_unique_wallets is stored but not enforced since we don't track claims
 
         // Calculate distribution amount using bonding curve with purchase amount
         let base_purchase_amount = if airdrop.use_exponential_decay {
-            generate_exponential_decay_random(airdrop.claims_made, recipient.key())?
+            generate_exponential_decay_random(airdrop.claims_made, recipient.key(), airdrop.airdrop_id)?
         } else {
             1_000_000_000 // Standard 1 SOL (in lamports) purchase for each claim
         };
@@ -135,22 +135,6 @@ pub mod airdrop_protocol {
         airdrop.remaining_supply = airdrop.remaining_supply.saturating_sub(actual_distribution_amount);
         airdrop.claims_made = airdrop.claims_made.saturating_add(1);
         airdrop.virtual_sol_reserves = airdrop.virtual_sol_reserves.saturating_add(purchase_amount);
-
-        // Update claim record
-        if airdrop.require_unique_wallets {
-            claim_record.recipient = recipient.key();
-            claim_record.airdrop = airdrop.key();
-            claim_record.amount_claimed = actual_distribution_amount;
-            claim_record.has_claimed = true;
-            claim_record.bump = ctx.bumps.claim_record;
-        } else {
-            // For non-unique wallets, we still track the claim but allow multiple
-            claim_record.recipient = recipient.key();
-            claim_record.airdrop = airdrop.key();
-            claim_record.amount_claimed = claim_record.amount_claimed.saturating_add(actual_distribution_amount);
-            claim_record.has_claimed = true;
-            claim_record.bump = ctx.bumps.claim_record;
-        }
 
         // Transfer tokens from airdrop vault to recipient
         let seeds = &[
@@ -396,8 +380,8 @@ pub mod airdrop_protocol {
 }
 
 /// Generates a random number from 1 to 20 SOL (in lamports) using exponential decay probability
-/// Uses the seed from claims_made and recipient key to ensure unique randomness per claim
-fn generate_exponential_decay_random(seed: u64, recipient_key: Pubkey) -> Result<u64> {
+/// Uses the seed from claims_made, recipient key, and airdrop ID to ensure unique randomness per claim
+fn generate_exponential_decay_random(seed: u64, recipient_key: Pubkey, airdrop_id: u64) -> Result<u64> {
     const MIN_VAL: f64 = 1.0;
     const MAX_VAL: f64 = 20.0;
     const DECAY_RATE: f64 = 0.4;
@@ -415,11 +399,12 @@ fn generate_exponential_decay_random(seed: u64, recipient_key: Pubkey) -> Result
         pubkey_hash ^= chunk_val;
     }
     
-    // Combine seed with pubkey hash using multiple operations for better mixing
+    // Combine seed with pubkey hash and airdrop ID using multiple operations for better mixing
     let combined_seed = seed
         .wrapping_mul(6364136223846793005u64)
         .wrapping_add(1442695040888963407u64)
         .wrapping_add(pubkey_hash)
+        .wrapping_add(airdrop_id)
         .wrapping_mul(1103515245)
         .wrapping_add(12345);
     
@@ -551,15 +536,6 @@ pub struct DistributeAirdrop<'info> {
     )]
     pub airdrop: Account<'info, AirdropAccount>,
     
-    #[account(
-        init_if_needed,
-        payer = recipient,
-        space = 8 + 32 + 32 + 8 + 1 + 1, // discriminator + recipient + airdrop + amount_claimed + has_claimed + bump
-        seeds = [b"claim", airdrop.key().as_ref(), recipient.key().as_ref()],
-        bump
-    )]
-    pub claim_record: Account<'info, ClaimRecord>,
-    
     #[account(mut)]
     pub recipient: Signer<'info>,
 
@@ -589,8 +565,6 @@ pub struct DistributeAirdrop<'info> {
     pub airdrop_vault: InterfaceAccount<'info, TokenAccount>,
     
     pub token_program: Interface<'info, TokenInterface>,
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
@@ -739,15 +713,6 @@ pub struct AirdropAccount {
     pub bump: u8,                           // 1 byte
 }
 
-#[account]
-pub struct ClaimRecord {
-    pub recipient: Pubkey,
-    pub airdrop: Pubkey,
-    pub amount_claimed: u64,
-    pub has_claimed: bool,
-    pub bump: u8,
-}
-
 #[event]
 pub struct AirdropCreated {
     pub airdrop: Pubkey,
@@ -803,8 +768,6 @@ pub struct AirdropRecharged {
 pub enum AirdropError {
     #[msg("Airdrop is already closed")]
     AirdropClosed,
-    #[msg("Recipient has already claimed tokens")]
-    AlreadyClaimed,
     #[msg("Insufficient tokens remaining for distribution")]
     InsufficientTokens,
     #[msg("Only the creator can close this airdrop")]
